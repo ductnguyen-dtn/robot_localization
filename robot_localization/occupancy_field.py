@@ -4,7 +4,7 @@
 import rclpy
 from nav_msgs.srv import GetMap
 import numpy as np
-from sklearn.neighbors import NearestNeighbors
+from scipy.spatial import cKDTree
 
 class OccupancyField(object):
     """ Stores an occupancy field for an input map.  An occupancy field returns
@@ -51,12 +51,12 @@ class OccupancyField(object):
                     occupied[curr, 0] = float(i)
                     occupied[curr, 1] = float(j)
                     curr += 1
-        node.get_logger().info("building ball tree")
-        # use super fast scikit learn nearest neighbor algorithm
-        nbrs = NearestNeighbors(n_neighbors=1,
-                                algorithm="ball_tree").fit(occupied)
+        node.get_logger().info("building kd-tree")
+        # scipy's cKDTree does the same nearest neighbor job as sklearn's
+        # ball tree here, without needing scikit-learn installed
+        tree = cKDTree(occupied)
         node.get_logger().info("finding neighbors")
-        distances, indices = nbrs.kneighbors(X)
+        distances, indices = tree.query(X)
 
         node.get_logger().info("populating occupancy field")
         self.closest_occ = np.zeros((self.map.info.width, self.map.info.height))
@@ -64,7 +64,7 @@ class OccupancyField(object):
         for i in range(self.map.info.width):
             for j in range(self.map.info.height):
                 self.closest_occ[i, j] = \
-                    distances[curr][0]*self.map.info.resolution
+                    distances[curr]*self.map.info.resolution
                 curr += 1
         self.occupied = occupied
         node.get_logger().info("occupancy field ready")
@@ -90,15 +90,15 @@ class OccupancyField(object):
         x_coord = (x - self.map.info.origin.position.x)/self.map.info.resolution
         y_coord = (y - self.map.info.origin.position.y)/self.map.info.resolution
         if type(x) is np.ndarray:
-            x_coord = x_coord.astype(np.int)
-            y_coord = y_coord.astype(np.int)
+            x_coord = x_coord.astype(int)
+            y_coord = y_coord.astype(int)
         else:
             x_coord = int(x_coord)
             y_coord = int(y_coord)
 
         is_valid = (x_coord >= 0) & (y_coord >= 0) & (x_coord < self.map.info.width) & (y_coord < self.map.info.height)
         if type(x) is np.ndarray:
-            distances = np.float('nan')*np.ones(x_coord.shape)
+            distances = np.nan*np.ones(x_coord.shape)
             distances[is_valid] = self.closest_occ[x_coord[is_valid], y_coord[is_valid]]
             return distances
         else:

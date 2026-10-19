@@ -15,8 +15,9 @@ from rclpy.duration import Duration
 import math
 import time
 import numpy as np
+from numpy.random import normal as sample_normal
 from occupancy_field import OccupancyField
-from helper_functions import TFHelper
+from helper_functions import TFHelper, draw_random_sample
 from rclpy.qos import qos_profile_sensor_data
 from angle_helpers import quaternion_from_euler
 
@@ -46,7 +47,9 @@ class Particle(object):
         return Pose(position=Point(x=self.x, y=self.y, z=0.0),
                     orientation=Quaternion(x=q[0], y=q[1], z=q[2], w=q[3]))
 
-    # TODO: define additional helper functions if needed
+    def __repr__(self):
+        return "Particle(x={:.2f}, y={:.2f}, theta={:.2f}, w={:.4f})".format(
+            self.x, self.y, self.theta, self.w)
 
 class ParticleFilter(Node):
     """ The class that represents a Particle Filter ROS Node
@@ -71,7 +74,7 @@ class ParticleFilter(Node):
     """
     def __init__(self):
         super().__init__('pf')
-        self.base_frame = "base_footprint"   # the frame of the robot base
+        self.base_frame = "base_link"   # the frame of the robot base
         self.map_frame = "map"          # the name of the map coordinate frame
         self.odom_frame = "odom"        # the name of the odometry coordinate frame
         self.scan_topic = "scan"        # the topic where we will get laser scans from 
@@ -81,7 +84,35 @@ class ParticleFilter(Node):
         self.d_thresh = 0.2             # the amount of linear movement before performing an update
         self.a_thresh = math.pi/6       # the amount of angular movement before performing an update
 
-        # TODO: define additional constants if needed
+        # spread of the initial particle cloud around the starting guess
+        self.init_sigma_xy = 0.3        # meters
+        self.init_sigma_theta = math.pi/6  # radians
+
+        # odometry motion model noise parameters, same naming as the
+        # sample_motion_model_odometry algorithm in Probabilistic Robotics
+        # (Thrun, Burgard, Fox). alpha1/alpha2 scale how much a rotation and
+        # a translation each add noise to the two rotation terms, and
+        # alpha3/alpha4 do the same for the translation term.
+        self.alpha1 = 0.2
+        self.alpha2 = 0.2
+        self.alpha3 = 0.2
+        self.alpha4 = 0.2
+
+        # laser likelihood model: how forgiving we are of a beam landing
+        # some distance away from the nearest known obstacle. A smaller
+        # sigma makes the filter more confident, but also more brittle to
+        # a slightly wrong map or a noisy reading.
+        self.laser_sigma_hit = 0.2      # meters
+        # only use every nth beam when scoring a particle against the scan,
+        # since checking all 360+ beams against every particle is the main
+        # cost of the whole filter. This is the accuracy/computation
+        # tradeoff the assignment calls out directly.
+        self.laser_beam_stride = 12
+
+        # after resampling, nudge each particle a little so the cloud
+        # doesn't collapse onto a handful of exact duplicates
+        self.resample_sigma_xy = 0.02    # meters
+        self.resample_sigma_theta = math.radians(2)
 
         # pose_listener responds to selection of a new approximate robot location (for instance using rviz)
         self.create_subscription(PoseWithCovarianceStamped, 'initialpose', self.update_initial_pose, 10)
@@ -184,9 +215,21 @@ class ParticleFilter(Node):
         # first make sure that the particle weights are normalized
         self.normalize_particles()
 
-        # TODO: assign the latest pose into self.robot_pose as a geometry_msgs.Pose object
-        # just to get started we will fix the robot's pose to always be at the origin
-        self.robot_pose = Pose()
+        if self.particle_cloud:
+            # weighted mean of x and y is straightforward. theta needs a
+            # circular mean instead of a plain average, or two particles
+            # at, say, theta = -3.13 and theta = 3.13 (which are almost the
+            # same heading) would average out to roughly 0, the opposite
+            # direction from either of them.
+            mean_x = sum(p.w*p.x for p in self.particle_cloud)
+            mean_y = sum(p.w*p.y for p in self.particle_cloud)
+            sin_sum = sum(p.w*math.sin(p.theta) for p in self.particle_cloud)
+            cos_sum = sum(p.w*math.cos(p.theta) for p in self.particle_cloud)
+            mean_theta = math.atan2(sin_sum, cos_sum)
+            self.robot_pose = Particle(x=mean_x, y=mean_y, theta=mean_theta).as_pose()
+        else:
+            self.robot_pose = Pose()
+
         if hasattr(self, 'odom_pose'):
             self.transform_helper.fix_map_to_odom_transform(self.robot_pose,
                                                             self.odom_pose)
@@ -212,7 +255,36 @@ class ParticleFilter(Node):
             self.current_odom_xy_theta = new_odom_xy_theta
             return
 
-        # TODO: modify particles using delta
+        dx, dy, dtheta = delta
+        trans = math.hypot(dx, dy)
+
+        if trans < 1e-6:
+            # the robot barely moved in x,y (it may have only turned in
+            # place). atan2(0, 0) is not well defined, so skip straight to
+            # treating the whole motion as a rotation instead of a
+            # translate-then-rotate, which keeps this from injecting noise
+            # based on a meaningless "direction of travel" angle.
+            rot1 = 0.0
+            rot2 = self.transform_helper.angle_diff(dtheta, 0.0)
+        else:
+            direction_of_travel = math.atan2(dy, dx)
+            rot1 = self.transform_helper.angle_diff(direction_of_travel, old_odom_xy_theta[2])
+            rot2 = self.transform_helper.angle_diff(dtheta, rot1)
+
+        # sample_motion_model_odometry (Probabilistic Robotics, table 5.6):
+        # treat the odometry reading itself as noisy, and add particle
+        # specific noise scaled by how large the motion was. A bigger move
+        # gets proportionally more uncertain.
+        n = len(self.particle_cloud)
+        rot1_noisy = rot1 + sample_normal(0.0, self.alpha1*rot1**2 + self.alpha2*trans**2, n)
+        trans_noisy = trans + sample_normal(0.0, self.alpha3*trans**2 + self.alpha4*(rot1**2 + rot2**2), n)
+        rot2_noisy = rot2 + sample_normal(0.0, self.alpha1*rot2**2 + self.alpha2*trans**2, n)
+
+        for p, r1, t, r2 in zip(self.particle_cloud, rot1_noisy, trans_noisy, rot2_noisy):
+            p.theta = self.transform_helper.angle_normalize(p.theta + r1)
+            p.x += t*math.cos(p.theta)
+            p.y += t*math.sin(p.theta)
+            p.theta = self.transform_helper.angle_normalize(p.theta + r2)
 
     def resample_particles(self):
         """ Resample the particles according to the new particle weights.
@@ -222,15 +294,80 @@ class ParticleFilter(Node):
         """
         # make sure the distribution is normalized
         self.normalize_particles()
-        # TODO: fill out the rest of the implementation
+
+        weights = [p.w for p in self.particle_cloud]
+        resampled = draw_random_sample(self.particle_cloud, weights, self.n_particles)
+
+        # draw_random_sample copies whichever particles survive, so a
+        # handful of good particles can turn into many exact duplicates.
+        # Jitter each copy a little and reset to uniform weight, so the
+        # next laser update has a reason to tell duplicates apart again
+        # instead of the cloud slowly collapsing to one point.
+        n = len(resampled)
+        x_noise = np.random.normal(0.0, self.resample_sigma_xy, n)
+        y_noise = np.random.normal(0.0, self.resample_sigma_xy, n)
+        theta_noise = np.random.normal(0.0, self.resample_sigma_theta, n)
+        for p, dx, dy, dtheta in zip(resampled, x_noise, y_noise, theta_noise):
+            p.x += dx
+            p.y += dy
+            p.theta = self.transform_helper.angle_normalize(p.theta + dtheta)
+            p.w = 1.0 / n
+
+        self.particle_cloud = resampled
 
     def update_particles_with_laser(self, r, theta):
         """ Updates the particle weights in response to the scan data
             r: the distance readings to obstacles
-            theta: the angle relative to the robot frame for each corresponding reading 
+            theta: the angle relative to the robot frame for each corresponding reading
+
+            This is the likelihood field model from Probabilistic Robotics:
+            for each particle, project every laser beam out from its
+            hypothesized pose, look up how far that endpoint lands from
+            the closest known obstacle in the map, and score the particle
+            higher the closer its beams land to a real wall.
         """
-        # TODO: implement this
-        pass
+        if not self.particle_cloud:
+            return
+
+        r = np.asarray(r)
+        theta = np.asarray(theta)
+        # drop beams with no real return (too close, too far, or inf/nan),
+        # and only keep every laser_beam_stride-th beam of what is left.
+        # Scoring every particle against every beam is the expensive part
+        # of the whole filter, so this is the main knob for the
+        # accuracy/computation tradeoff.
+        valid = np.isfinite(r) & (r > 0.05)
+        r = r[valid][::self.laser_beam_stride]
+        theta = theta[valid][::self.laser_beam_stride]
+        if len(r) == 0:
+            return
+
+        xs = np.array([p.x for p in self.particle_cloud])
+        ys = np.array([p.y for p in self.particle_cloud])
+        thetas = np.array([p.theta for p in self.particle_cloud])
+
+        # work in log likelihood so that one bad beam does not zero out a
+        # particle's weight outright, and so a particle with many
+        # consistent beams doesn't underflow to 0 once multiplied together.
+        log_weights = np.zeros(len(self.particle_cloud))
+        for r_i, theta_i in zip(r, theta):
+            hit_x = xs + r_i*np.cos(thetas + theta_i)
+            hit_y = ys + r_i*np.sin(thetas + theta_i)
+            dist_to_obstacle = self.occupancy_field.get_closest_obstacle_distance(hit_x, hit_y)
+            # a beam that lands off the map gets treated as a bad reading,
+            # not as "perfectly matches a wall" or "automatically rules the
+            # particle out"
+            dist_to_obstacle = np.nan_to_num(dist_to_obstacle, nan=3.0*self.laser_sigma_hit)
+            log_weights += -(dist_to_obstacle**2) / (2.0*self.laser_sigma_hit**2)
+
+        # shift by the max before exponentiating so the weights stay in a
+        # sane floating point range; normalize_particles() (called right
+        # after this, in update_robot_pose) takes care of making them sum
+        # to 1 again.
+        log_weights -= log_weights.max()
+        weights = np.exp(log_weights)
+        for p, w in zip(self.particle_cloud, weights):
+            p.w = w
 
     def update_initial_pose(self, msg):
         """ Callback function to handle re-initializing the particle filter based on a pose estimate.
@@ -245,16 +382,35 @@ class ParticleFilter(Node):
                       particle cloud around.  If this input is omitted, the odometry will be used """
         if xy_theta is None:
             xy_theta = self.transform_helper.convert_pose_to_xy_and_theta(self.odom_pose)
-        self.particle_cloud = []
-        # TODO create particles
+        x0, y0, theta0 = xy_theta
+
+        # scatter particles in a Gaussian cloud around the starting guess.
+        # This is the "initialize by random sampling" step of the filter.
+        xs = np.random.normal(x0, self.init_sigma_xy, self.n_particles)
+        ys = np.random.normal(y0, self.init_sigma_xy, self.n_particles)
+        thetas = np.random.normal(theta0, self.init_sigma_theta, self.n_particles)
+
+        self.particle_cloud = [Particle(x=xs[i], y=ys[i], theta=thetas[i], w=1.0)
+                                for i in range(self.n_particles)]
 
         self.normalize_particles()
         self.update_robot_pose()
 
     def normalize_particles(self):
         """ Make sure the particle weights define a valid distribution (i.e. sum to 1.0) """
-        # TODO: implement this
-        pass
+        if not self.particle_cloud:
+            return
+        total_weight = sum(p.w for p in self.particle_cloud)
+        if total_weight <= 0.0:
+            # degenerate case, every particle somehow ended up with zero
+            # weight. Fall back to a uniform distribution rather than
+            # dividing by zero.
+            uniform_weight = 1.0 / len(self.particle_cloud)
+            for p in self.particle_cloud:
+                p.w = uniform_weight
+            return
+        for p in self.particle_cloud:
+            p.w /= total_weight
 
     def publish_particles(self, timestamp):
         msg = ParticleCloud()
