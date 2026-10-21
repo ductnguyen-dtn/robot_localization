@@ -6,9 +6,8 @@ import rclpy
 from threading import Thread
 from rclpy.time import Time
 from rclpy.node import Node
-from std_msgs.msg import Header
 from sensor_msgs.msg import LaserScan
-from nav2_msgs.msg import ParticleCloud, Particle
+from nav2_msgs.msg import ParticleCloud
 from nav2_msgs.msg import Particle as Nav2Particle
 from geometry_msgs.msg import PoseWithCovarianceStamped, Pose, Point, Quaternion
 from rclpy.duration import Duration
@@ -34,8 +33,8 @@ class Particle(object):
         """ Construct a new Particle
             x: the x-coordinate of the hypothesis relative to the map frame
             y: the y-coordinate of the hypothesis relative ot the map frame
-            theta: the yaw of KeyboardInterruptthe hypothesis relative to the map frame
-            w: the particle weight (the class does not ensure that particle weights are normalized """ 
+            theta: the yaw of the hypothesis relative to the map frame
+            w: the particle weight (the class does not ensure that particle weights are normalized """
         self.w = w
         self.theta = theta
         self.x = x
@@ -77,7 +76,7 @@ class ParticleFilter(Node):
         self.base_frame = "base_footprint"   # the frame of the robot base
         self.map_frame = "map"          # the name of the map coordinate frame
         self.odom_frame = "odom"        # the name of the odometry coordinate frame
-        self.scan_topic = "scan"        # the topic where we will get laser scans from 
+        self.scan_topic = "scan"        # the topic where we will get laser scans from
 
         self.n_particles = 300          # the number of particles to use
 
@@ -160,7 +159,7 @@ class ParticleFilter(Node):
         """ This is the main run_loop of our particle filter.  It checks to see if
             any scans are ready and to be processed and will call several helper
             functions to complete the processing.
-            
+
             You do not need to modify this function, but it is helpful to understand it.
         """
         if self.scan_to_process is None:
@@ -176,15 +175,13 @@ class ParticleFilter(Node):
                 # we will never get this transform, since it is before our oldest one
                 self.scan_to_process = None
             return
-        
+
         (r, theta) = self.transform_helper.convert_scan_to_polar_in_robot_frame(msg, self.base_frame)
-        print("r[0]={0}, theta[0]={1}".format(r[0], theta[0]))
         # clear the current scan so that we can process the next one
         self.scan_to_process = None
 
         self.odom_pose = new_pose
         new_odom_xy_theta = self.transform_helper.convert_pose_to_xy_and_theta(self.odom_pose)
-        print("x: {0}, y: {1}, yaw: {2}".format(*new_odom_xy_theta))
 
         if not self.current_odom_xy_theta:
             self.current_odom_xy_theta = new_odom_xy_theta
@@ -204,7 +201,6 @@ class ParticleFilter(Node):
         return math.fabs(new_odom_xy_theta[0] - self.current_odom_xy_theta[0]) > self.d_thresh or \
                math.fabs(new_odom_xy_theta[1] - self.current_odom_xy_theta[1]) > self.d_thresh or \
                math.fabs(new_odom_xy_theta[2] - self.current_odom_xy_theta[2]) > self.a_thresh
-
 
     def update_robot_pose(self):
         """ Update the estimate of the robot's pose given the updated particles.
@@ -423,7 +419,7 @@ class ParticleFilter(Node):
     def scan_received(self, msg):
         self.last_scan_timestamp = msg.header.stamp
         # we throw away scans until we are done processing the previous scan
-        # self.scan_to_process is set to None in the run_loop 
+        # self.scan_to_process is set to None in the run_loop
         if self.scan_to_process is None:
             self.scan_to_process = msg
 
