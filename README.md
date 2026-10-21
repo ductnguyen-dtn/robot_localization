@@ -31,6 +31,10 @@ built with `slam_toolbox`, the filter's estimate stayed within roughly
 particle cloud's spread visibly shrinking as it converged. Details and
 numbers are in [Experimental Design](#experimental-design).
 
+![Particle cloud converged tightly against the map](media/particle_cloud_converged.png)
+*The 300-particle cloud (red) after converging near the top wall of the
+clean map. Full run in [`bags/pf_clean_demo`](bags/pf_clean_demo).*
+
 ## Approach to State Estimation
 
 ### Algorithm Overview
@@ -101,6 +105,19 @@ particles. Adding a small Gaussian nudge (2 cm, 2 degrees) to every
 resampled particle keeps the cloud able to represent a little ongoing
 uncertainty instead of collapsing onto one point.
 
+**Likelihood field instead of ray tracing.** The assignment lists
+reimplementing ray tracing (simulating a full laser scan per particle
+against the map) as an alternative to the provided likelihood field. I
+used the provided `occupancy_field.py` lookup instead: each beam just
+looks up the precomputed nearest-obstacle distance for its endpoint,
+rather than simulating a scan from scratch. With 300 particles and ~30
+beams scored per update, that's thousands of lookups every update cycle,
+and a precomputed nearest-neighbor query is far cheaper than a ray-march
+per beam would be. The tradeoff is that it can't model occlusion the way
+true ray tracing would (it can't tell that a wall is hidden behind
+another wall from a given pose), which didn't matter in this mostly
+open gauntlet world but would in a more cluttered one.
+
 ### Unit Test Design and Integration
 
 `test/test_pf_logic.py` covers the two pieces of this implementation that
@@ -162,24 +179,78 @@ A recorded demo of this run, including the particle cloud, the map, and
 all transforms, is in [`bags/pf_gauntlet_demo`](bags/pf_gauntlet_demo),
 described further in [`bags/README.md`](bags/README.md).
 
+**Follow-up check after rebuilding the map (see Challenges below).** After
+replacing the map with a cleanly-mapped one and fixing the frame naming
+at its root, I spot-checked the filter again against Gazebo's ground
+truth: at one instant mid-run, the filter's estimate was `(0.716, 0.640)`
+against a true position of `(0.760, 0.615)`, a 5.0 cm error, while raw
+odometry at the same instant read `(0.772, 0.751)`, a 13.7 cm error. This
+is the clearer before/after comparison this project was missing: the
+filter cutting odometry's error by more than half at a moment where
+odometry had actually accumulated some visible drift. Recorded in
+[`bags/pf_clean_demo`](bags/pf_clean_demo).
+
 ## Challenges and Next Steps
 
 **The robot's actual TF frame names didn't match the starter code's
-assumptions.** `pf.py` is written assuming a `base_footprint` frame
-between `odom` and the robot's links, and `slam_toolbox`'s default config
-assumes the same. This robot's live TF tree only ever had `base_link`
-directly under `odom` (there's an unused, disconnected `base_footprint`
-static frame left over in the URDF, but nothing actually publishes a
-transform connecting it to the live tree). Both `slam_toolbox` and
-`pf.py` silently failed in different ways because of this: `slam_toolbox`
-logged "Failed to compute odom pose" indefinitely, while `pf.py`'s
-`run_loop` just returned early every cycle with no error at all, since
-`get_matching_odom_pose` treats "transform not available" as "try again
-next cycle" rather than as a problem worth logging loudly. Finding this
-took generating the live TF tree with `view_frames` rather than trusting
-either piece of starter code's assumptions about frame names. The fix was
-pointing both `slam_toolbox`'s `base_frame` parameter and `pf.py`'s
-`self.base_frame` at `base_link` instead.
+assumptions, and it turned out to be a real bug, not just a mismatch.**
+`pf.py` is written assuming a `base_footprint` frame between `odom` and
+the robot's links, and `slam_toolbox`'s default config assumes the same.
+This robot's live TF tree only ever had `base_link` directly under `odom`
+(there was an unused, disconnected `base_footprint` static frame left
+over in the URDF, but nothing actually published a transform connecting
+it to the live tree). Both `slam_toolbox` and `pf.py` silently failed in
+different ways because of this: `slam_toolbox` logged "Failed to compute
+odom pose" indefinitely, while `pf.py`'s `run_loop` just returned early
+every cycle with no error at all, since `get_matching_odom_pose` treats
+"transform not available" as "try again next cycle" rather than as a
+problem worth logging loudly. Finding this took generating the live TF
+tree with `view_frames` rather than trusting either piece of starter
+code's assumptions about frame names.
+
+My first fix was a local workaround: point both `slam_toolbox`'s
+`base_frame` parameter and `pf.py`'s `self.base_frame` at `base_link`
+instead of `base_footprint`. That got everything working, but it turned
+out the actual bug was upstream in `neato_packages`' simulated robot
+model, which the course fixed in a commit literally titled "fixes
+base_footprint bug for the default slam toolbox" (pulled after this). The
+real fix renames the robot's link so `base_footprint` is the one properly
+connected in the TF tree, which is the opposite direction from my
+workaround. After pulling that update, I reverted `pf.py`'s
+`self.base_frame` back to `base_footprint` to match the corrected model,
+rather than keeping the local patch. Worth noting as its own lesson:
+a workaround that makes a symptom go away isn't the same as finding the
+actual bug, and it's worth checking whether an upstream fix already
+exists before settling for your own patch.
+
+**Scripted driving for SLAM mapping reliably corrupted the map through
+wheel slip, and the cell counts alone didn't reveal it.** Building a map
+with `slam_toolbox` means driving the robot around the world first. I
+initially drove it with a timed, scripted loop (no sensing at all), which
+worked, but a later attempt at adding obstacle-avoidance logic to that
+script still repeatedly drove the robot into walls. When a wheel pushes
+against something it can't move through, the wheel encoder keeps
+reporting rotation even though the chassis isn't actually moving, so the
+odometry integrates distance that never happened. `slam_toolbox` trusts
+that odometry as a motion prior when deciding where to place a new scan,
+so the result was a map that looked structurally fine by simple
+summary statistics (occupied/free cell counts in a reasonable range) but
+was actually full of broken, streaky artifacts once I rendered and looked
+at the actual image:
+
+![Map corrupted by odometry drift from wheel slip](media/map_before_corrupted.png)
+![Clean map built by driving carefully](media/map_after_clean.png)
+*Left: map built from scripted driving that repeatedly hit walls. Right:
+map built driving the same world manually, avoiding contact. Same world,
+same mapping algorithm and parameters, the only difference is the
+driving input `slam_toolbox` was given.*
+
+The fix was driving the robot manually instead of scripting it, which
+produced a clean map on the first attempt. The broader lesson: a mapping
+or localization result can look fine by any single summary number (cell
+counts, particle count, even a plausible-looking pose) while still being
+wrong, and the only way to catch that is to actually look at the
+rendered output rather than trusting aggregate statistics about it.
 
 **`scikit-learn` wasn't available and needed a system package install I
 couldn't run non-interactively.** The provided `occupancy_field.py` uses
@@ -204,6 +275,9 @@ versus the original code's assumption of a 2-D `kneighbors` result).
 - Tune `laser_beam_stride` and `laser_sigma_hit` against a real accuracy-
   versus-runtime measurement, rather than the reasonable-sounding values
   currently in use.
+- Add real obstacle avoidance (reading the live laser scan, not just
+  reacting to a bump after the fact) for any future scripted driving, so
+  mapping doesn't depend on a human driving carefully every time.
 
 ## Learning Objectives and Final Takeaways
 
@@ -228,12 +302,21 @@ The second was that a disconnected TF frame doesn't always announce
 itself as an error; `pf.py`'s run loop failed silently rather than
 loudly, which meant the real debugging tool was inspecting the live TF
 tree directly rather than trusting either piece of starter code's
-comments about frame names.
+comments about frame names. The third, from the map corruption issue, is
+that summary statistics about a result (cell counts, particle counts)
+are not a substitute for actually looking at the result; I would have
+kept trusting a broken map if I hadn't rendered and looked at it
+directly. The fourth is that a local workaround for a bug is worth
+double-checking against the actual upstream source before treating it as
+the real fix, since in this case the real bug (and its real fix) lived
+one level up, in the robot model package, not in my own code.
 
 ## How To Run
 
 Prerequisites: ROS 2 Jazzy, the `neato2_gazebo`/`neato2_interfaces`
-packages in the same workspace, and `scipy` (used in place of
+packages (`neato_packages`, pulled at or after commit `4703090`, which
+includes the upstream `base_footprint` fix referenced in Challenges
+above) in the same workspace, and `scipy` (used in place of
 `scikit-learn`, see Challenges above).
 
 1. Clone this fork and build:
@@ -249,15 +332,19 @@ packages in the same workspace, and `scipy` (used in place of
    ros2 launch neato2_gazebo neato_gauntlet_world.py
    ```
 3. Start the map server and the particle filter together, pointing at the
-   included map (built from this same world with `slam_toolbox`):
+   clean map (built from this same world by driving it manually, see
+   Challenges above):
    ```bash
-   ros2 launch robot_localization test_pf.py map_yaml:=src/robot_localization/maps/neato_gauntlet.yaml use_sim_time:=true
+   ros2 launch robot_localization test_pf.py map_yaml:=src/robot_localization/maps/neato_gauntlet_clean.yaml use_sim_time:=true
    ```
 4. Drive the robot (teleop, or publish directly to `/cmd_vel`) and watch
-   `/particle_cloud` in RViz (fixed frame `map`) to see it converge.
+   `/particle_cloud` in RViz (fixed frame `map`, with the `/map` display's
+   durability policy set to Transient Local so it picks up the map that
+   was already published before RViz connected) to see it converge.
 5. To watch the recorded demo instead of a live run:
    ```bash
-   ros2 bag play bags/pf_gauntlet_demo --clock
+   ros2 bag play bags/pf_clean_demo --clock
    ```
-   See [`bags/README.md`](bags/README.md) for what's in it and which
-   displays to add in RViz.
+   See [`bags/README.md`](bags/README.md) for what's in it, including an
+   earlier run kept for before/after comparison, and which displays to
+   add in RViz.

@@ -74,7 +74,7 @@ class ParticleFilter(Node):
     """
     def __init__(self):
         super().__init__('pf')
-        self.base_frame = "base_link"   # the frame of the robot base
+        self.base_frame = "base_footprint"   # the frame of the robot base
         self.map_frame = "map"          # the name of the map coordinate frame
         self.odom_frame = "odom"        # the name of the odometry coordinate frame
         self.scan_topic = "scan"        # the topic where we will get laser scans from 
